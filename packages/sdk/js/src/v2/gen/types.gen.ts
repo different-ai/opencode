@@ -941,6 +941,14 @@ export type EventWorktreeFailed = {
   }
 }
 
+export type EventOpencodeHotreloadChanged = {
+  type: "opencode.hotreload.changed"
+  properties: {
+    file: string
+    event: "add" | "change" | "unlink"
+  }
+}
+
 export type EventOpencodeHotreloadApplied = {
   type: "opencode.hotreload.applied"
   properties: {
@@ -993,6 +1001,7 @@ export type Event =
   | EventPtyDeleted
   | EventWorktreeReady
   | EventWorktreeFailed
+  | EventOpencodeHotreloadChanged
   | EventOpencodeHotreloadApplied
 
 export type GlobalEvent = {
