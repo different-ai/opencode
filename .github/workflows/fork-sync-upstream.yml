@@ -1,0 +1,158 @@
+name: fork-sync-upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: "Upstream branch to sync from"
+        required: false
+        default: "dev"
+      patch_branch:
+        description: "Fork patch branch to preserve"
+        required: false
+        default: "feat/hot-reload-smooth"
+      base_branch:
+        description: "Fork base branch to open PR into"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: fork-sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: anomalyco/opencode
+      UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || vars.FORK_UPSTREAM_BRANCH || 'dev' }}
+      PATCH_BRANCH: ${{ github.event.inputs.patch_branch || vars.FORK_PATCH_BRANCH || 'feat/hot-reload-smooth' }}
+      BASE_BRANCH: ${{ github.event.inputs.base_branch || vars.FORK_SYNC_BASE_BRANCH || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create fork-sync --repo "$GITHUB_REPOSITORY" --color 1f6feb --description "Automated upstream sync PR" 2>/dev/null || true
+          gh label create sync-conflict --repo "$GITHUB_REPOSITORY" --color d73a4a --description "Sync PR currently has conflicts" 2>/dev/null || true
+          gh label create janitor-needed --repo "$GITHUB_REPOSITORY" --color fbca04 --description "Needs janitor repair pass" 2>/dev/null || true
+
+      - name: Fetch upstream and fork branches
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune origin "${BASE_BRANCH}" "${PATCH_BRANCH}"
+          git fetch --prune upstream "${UPSTREAM_BRANCH}"
+
+      - name: Prepare sync branch
+        id: prep
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y%m%d-%H%M%S)"
+          upstream_sha="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+          sync_branch="sync/${UPSTREAM_BRANCH}-${stamp}-${upstream_sha}"
+          git checkout -B "$sync_branch" "origin/${PATCH_BRANCH}"
+          echo "sync_branch=$sync_branch" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase patch branch on upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+          rebase_ok=true
+          conflicts=""
+
+          if ! git rebase "upstream/${UPSTREAM_BRANCH}"; then
+            rebase_ok=false
+            conflicts="$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/[[:space:]]\+$//')"
+            git rebase --abort || true
+          fi
+
+          echo "rebase_ok=$rebase_ok" >> "$GITHUB_OUTPUT"
+          echo "conflicts=$conflicts" >> "$GITHUB_OUTPUT"
+
+      - name: Push sync branch
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "${{ steps.prep.outputs.sync_branch }}"
+
+      - name: Open or update sync PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.prep.outputs.sync_branch }}
+          REBASE_OK: ${{ steps.rebase.outputs.rebase_ok }}
+          CONFLICTS: ${{ steps.rebase.outputs.conflicts }}
+          UPSTREAM_SHA: ${{ steps.prep.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          body_file="$(mktemp)"
+          {
+            echo "## Summary"
+            echo "- Upstream: ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${UPSTREAM_SHA})"
+            echo "- Patch branch: ${PATCH_BRANCH}"
+            echo "- Base branch: ${BASE_BRANCH}"
+            echo "- Rebase status: ${REBASE_OK}"
+            if [ "${REBASE_OK}" != "true" ]; then
+              echo ""
+              echo "## Conflict Details"
+              echo "- Conflicting files: ${CONFLICTS:-none reported}"
+              echo "- Label `janitor-needed` added; janitor workflow will attempt repair."
+            fi
+          } > "$body_file"
+
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
+
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --title "chore(sync): ${PATCH_BRANCH} onto upstream/${UPSTREAM_BRANCH}" --body-file "$body_file"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "$BASE_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "chore(sync): ${PATCH_BRANCH} onto upstream/${UPSTREAM_BRANCH}" \
+              --body-file "$body_file"
+            pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
+          fi
+
+          if [ -z "$pr_number" ]; then
+            echo "Unable to resolve sync PR number." >&2
+            exit 1
+          fi
+
+          gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --add-label fork-sync
+          if [ "${REBASE_OK}" = "true" ]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --remove-label sync-conflict 2>/dev/null || true
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --remove-label janitor-needed 2>/dev/null || true
+          else
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --add-label sync-conflict --add-label janitor-needed
+            gh pr comment "$pr_number" --repo "$GITHUB_REPOSITORY" --body "Automated sync hit conflicts while rebasing onto upstream/${UPSTREAM_BRANCH}. Janitor will attempt a repair pass."
+          fi
+
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Fail workflow when janitor is needed
+        if: steps.rebase.outputs.rebase_ok != 'true'
+        run: |
+          echo "Rebase conflicts detected. PR opened and labeled for janitor." >&2
+          exit 1
