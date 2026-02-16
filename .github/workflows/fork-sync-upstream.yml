@@ -8,15 +8,12 @@ on:
       upstream_branch:
         description: "Upstream branch to sync from"
         required: false
-        default: "dev"
       patch_branch:
         description: "Fork patch branch to preserve"
         required: false
-        default: "feat/hot-reload-smooth"
       base_branch:
         description: "Fork base branch to open PR into"
         required: false
-        default: "dev"
 
 permissions:
   contents: write

@@ -14,11 +14,9 @@ on:
       upstream_branch:
         description: "Upstream branch to rebase onto"
         required: false
-        default: "dev"
       base_branch:
         description: "Fork base branch for sync PRs"
         required: false
-        default: "dev"
 
 permissions:
   contents: write
