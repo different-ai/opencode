@@ -67,9 +67,10 @@ jobs:
         id: prep
         run: |
           set -euo pipefail
-          stamp="$(date -u +%Y%m%d-%H%M%S)"
           upstream_sha="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
-          sync_branch="sync/${UPSTREAM_BRANCH}-${stamp}-${upstream_sha}"
+          safe_patch="$(echo "${PATCH_BRANCH}" | tr '/' '-')"
+          safe_upstream="$(echo "${UPSTREAM_BRANCH}" | tr '/' '-')"
+          sync_branch="sync/${safe_patch}-onto-${safe_upstream}"
           git checkout -B "$sync_branch" "origin/${PATCH_BRANCH}"
           echo "sync_branch=$sync_branch" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
