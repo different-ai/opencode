@@ -57,6 +57,10 @@ export namespace ToolRegistry {
     return { custom }
   })
 
+  export async function reset() {
+    await state.reset()
+  }
+
   function fromPlugin(id: string, def: ToolDefinition): Tool.Info {
     return {
       id,
@@ -149,9 +153,17 @@ export namespace ToolRegistry {
         })
         .map(async (t) => {
           using _ = log.time(t.id)
+          const tool = await t.init({ agent })
+          const output = {
+            description: tool.description,
+            parameters: tool.parameters,
+          }
+          await Plugin.trigger("tool.definition", { toolID: t.id }, output)
           return {
             id: t.id,
-            ...(await t.init({ agent })),
+            ...tool,
+            description: output.description,
+            parameters: output.parameters,
           }
         }),
     )

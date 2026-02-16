@@ -1,5 +1,4 @@
 import { Plugin } from "../plugin"
-import { Share } from "../share/share"
 import { Format } from "../format"
 import { LSP } from "../lsp"
 import { FileWatcher } from "../file/watcher"
@@ -13,15 +12,16 @@ import { Log } from "@/util/log"
 import { ShareNext } from "@/share/share-next"
 import { Snapshot } from "../snapshot"
 import { Truncate } from "../tool/truncation"
+import { HotReload } from "./hotreload"
 
 export async function InstanceBootstrap() {
   Log.Default.info("bootstrapping", { directory: Instance.directory })
   await Plugin.init()
-  Share.init()
   ShareNext.init()
   Format.init()
   await LSP.init()
   FileWatcher.init()
+  HotReload.init()
   File.init()
   Vcs.init()
   Snapshot.init()
