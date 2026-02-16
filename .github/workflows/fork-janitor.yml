@@ -1,0 +1,262 @@
+name: fork-janitor
+
+on:
+  workflow_run:
+    workflows: ["fork-sync-upstream"]
+    types: [completed]
+  schedule:
+    - cron: "47 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Specific sync PR number to repair"
+        required: false
+      upstream_branch:
+        description: "Upstream branch to rebase onto"
+        required: false
+        default: "dev"
+      base_branch:
+        description: "Fork base branch for sync PRs"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: fork-janitor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  janitor:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: anomalyco/opencode
+      UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || vars.FORK_UPSTREAM_BRANCH || 'dev' }}
+      BASE_BRANCH: ${{ github.event.inputs.base_branch || vars.FORK_SYNC_BASE_BRANCH || 'dev' }}
+      PATCH_BRANCH: ${{ vars.FORK_PATCH_BRANCH || 'feat/hot-reload-smooth' }}
+      JANITOR_MODEL: ${{ vars.FORK_JANITOR_MODEL || 'openai/gpt-4.1' }}
+      INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and origin
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune origin
+          git fetch --prune upstream "${UPSTREAM_BRANCH}"
+
+      - name: Select target sync PR
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${INPUT_PR_NUMBER}"
+          if [ -n "$pr_number" ]; then
+            head_branch="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')"
+            echo "needs_fix=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+            echo "head_branch=$head_branch" >> "$GITHUB_OUTPUT"
+            echo "reason=manual_dispatch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --base "$BASE_BRANCH" \
+            --label fork-sync \
+            --limit 30 \
+            --json number,headRefName,url,title,mergeStateStatus,statusCheckRollup,updatedAt > /tmp/fork_sync_prs.json
+
+          candidate="$(jq -c '
+            map(select(
+              (.mergeStateStatus == "DIRTY") or
+              (.mergeStateStatus == "BEHIND") or
+              (.mergeStateStatus == "BLOCKED") or
+              ([.statusCheckRollup[]? | select(
+                .conclusion == "FAILURE" or
+                .conclusion == "TIMED_OUT" or
+                .conclusion == "CANCELLED" or
+                .conclusion == "ACTION_REQUIRED" or
+                .conclusion == "STARTUP_FAILURE"
+              )] | length > 0)
+            ))
+            | sort_by(.updatedAt)
+            | reverse
+            | .[0] // empty
+          ' /tmp/fork_sync_prs.json)"
+
+          if [ -z "$candidate" ] || [ "$candidate" = "null" ]; then
+            echo "needs_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pr_number="$(echo "$candidate" | jq -r '.number')"
+          head_branch="$(echo "$candidate" | jq -r '.headRefName')"
+          merge_state="$(echo "$candidate" | jq -r '.mergeStateStatus')"
+
+          echo "needs_fix=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$head_branch" >> "$GITHUB_OUTPUT"
+          echo "reason=$merge_state" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when nothing needs repair
+        if: steps.target.outputs.needs_fix != 'true'
+        run: echo "No sync PR currently needs janitor repair."
+
+      - name: Check OPENAI_API_KEY
+        id: key
+        if: steps.target.outputs.needs_fix == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Comment when OPENAI_API_KEY is missing
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ steps.target.outputs.pr_number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "Janitor skipped because OPENAI_API_KEY is not configured in repository secrets."
+
+      - name: Checkout target branch
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --prune origin "${{ steps.target.outputs.head_branch }}"
+          git checkout -B "${{ steps.target.outputs.head_branch }}" "origin/${{ steps.target.outputs.head_branch }}"
+
+      - name: Attempt upstream rebase
+        id: rebase
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          rebase_ok=true
+          if ! git rebase "upstream/${UPSTREAM_BRANCH}"; then
+            rebase_ok=false
+          fi
+          conflicts="$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/[[:space:]]\+$//')"
+          echo "rebase_ok=$rebase_ok" >> "$GITHUB_OUTPUT"
+          echo "conflicts=$conflicts" >> "$GITHUB_OUTPUT"
+
+      - name: Build janitor context
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          gh pr view "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json number,title,body,url,baseRefName,headRefName,mergeStateStatus,statusCheckRollup > /tmp/janitor-pr.json
+
+          {
+            echo "You are the fork janitor for ${GITHUB_REPOSITORY}."
+            echo ""
+            echo "Goal: repair the current sync branch so upstream updates can land while preserving downstream behavior from ${PATCH_BRANCH:-feat/hot-reload-smooth}."
+            echo ""
+            echo "Repository state:"
+            echo "- base branch: ${BASE_BRANCH}"
+            echo "- upstream branch: ${UPSTREAM_BRANCH}"
+            echo "- target PR number: ${PR_NUMBER}"
+            echo "- target branch: ${{ steps.target.outputs.head_branch }}"
+            echo "- sync reason: ${{ steps.target.outputs.reason }}"
+            echo "- rebase ok: ${{ steps.rebase.outputs.rebase_ok }}"
+            echo "- conflicts: ${{ steps.rebase.outputs.conflicts }}"
+            echo ""
+            echo "Tasks (in order):"
+            echo "1. If a rebase is in progress, resolve conflicts and complete the rebase onto upstream/${UPSTREAM_BRANCH}."
+            echo "2. Keep the downstream patch behavior intact (hot-reload fixes from the fork patch branch)."
+            echo "3. Run a focused validation command and fix obvious breakages (prefer 'bun run typecheck')."
+            echo "4. Stage all needed changes and create a single commit with message: chore(sync): janitor repair upstream sync"
+            echo "5. Do not push; workflow will push."
+            echo ""
+            echo "Constraints:"
+            echo "- Touch only files needed for merge/conflict/test repair."
+            echo "- Never delete workflows unrelated to sync/release."
+            echo "- Never change release tags or package versions in this janitor pass."
+          } > /tmp/janitor-prompt.txt
+
+      - name: Install opencode
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Run janitor LLM repair
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENCODE_PERMISSION: '{"bash":{"*":"deny","git*":"allow","bun*":"allow","pnpm*":"allow","gh*":"allow"}}'
+        run: |
+          opencode run -m "$JANITOR_MODEL" "$(cat /tmp/janitor-prompt.txt)"
+
+      - name: Finalize branch and push
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+
+          unresolved="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$unresolved" ]; then
+            echo "Unresolved conflicts remain:" >&2
+            echo "$unresolved" >&2
+            exit 1
+          fi
+
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+            echo "Rebase still in progress after janitor pass." >&2
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(sync): janitor repair upstream sync"
+            fi
+          fi
+
+          git push --force-with-lease origin "${{ steps.target.outputs.head_branch }}"
+
+      - name: Update PR labels and comment
+        if: steps.target.outputs.needs_fix == 'true' && steps.key.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          unresolved="$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/[[:space:]]\+$//')"
+          if [ -n "$unresolved" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "Janitor ran but unresolved conflicts remain: $unresolved"
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label sync-conflict --add-label janitor-needed
+            exit 1
+          fi
+
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label sync-conflict 2>/dev/null || true
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label janitor-needed 2>/dev/null || true
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "Janitor repair pass completed and pushed updates to `${{ steps.target.outputs.head_branch }}`."
