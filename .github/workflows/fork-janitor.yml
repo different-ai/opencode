@@ -257,4 +257,4 @@ jobs:
 
           gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label sync-conflict 2>/dev/null || true
           gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label janitor-needed 2>/dev/null || true
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "Janitor repair pass completed and pushed updates to `${{ steps.target.outputs.head_branch }}`."
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "Janitor repair pass completed and pushed updates to ${{ steps.target.outputs.head_branch }}."
