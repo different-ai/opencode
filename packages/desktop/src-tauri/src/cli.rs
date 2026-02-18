@@ -391,9 +391,9 @@ pub fn spawn_command(
                 let _ = tx.send(CommandEvent::Error(err.to_string())).await;
             }
         }
-
         stdout.abort();
         stderr.abort();
+
     });
 
     let event_stream = ReceiverStream::new(rx);
