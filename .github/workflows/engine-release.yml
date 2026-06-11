@@ -1,0 +1,99 @@
+name: engine-release
+
+# Builds the opencode CLI engine from an upstream tag (+ optional OpenWork
+# patches) and publishes the zips/tarballs as a GitHub release on this fork.
+# Asset names match upstream exactly, so OpenWork's prepare-sidecar.mjs,
+# Dockerfiles, and orchestrator can consume them by only switching the repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag or sha to build (e.g. v1.16.2)"
+        required: true
+        type: string
+      version:
+        description: "Fork release version, no leading v (e.g. 1.16.2-openwork.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      upstream_ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout the fork default branch to pick up OpenWork patches.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Stash OpenWork patches
+        run: |
+          mkdir -p "$RUNNER_TEMP/openwork-patches"
+          if compgen -G "openwork/patches/*.patch" > /dev/null; then
+            cp openwork/patches/*.patch "$RUNNER_TEMP/openwork-patches/"
+            echo "Found $(ls "$RUNNER_TEMP/openwork-patches" | wc -l) patch(es)"
+          else
+            echo "No patches found; building pristine upstream ref"
+          fi
+
+      # 2. Switch the working tree to the upstream ref we want to build.
+      - name: Checkout upstream ref
+        run: |
+          git remote add upstream https://github.com/anomalyco/opencode.git
+          git fetch --tags --force upstream "${{ inputs.upstream_ref }}"
+          git checkout -B build "${{ inputs.upstream_ref }}"
+
+      - name: Apply OpenWork patches
+        run: |
+          if compgen -G "$RUNNER_TEMP/openwork-patches/*.patch" > /dev/null; then
+            git config user.name "openwork-engine-bot"
+            git config user.email "engineering@different.ai"
+            git am "$RUNNER_TEMP"/openwork-patches/*.patch
+          fi
+
+      # 3. Tag the exact build commit and create the release up front so
+      #    build.ts can `gh release upload` into it.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          git config user.name "openwork-engine-bot"
+          git config user.email "engineering@different.ai"
+          git tag -f "v${VERSION}"
+          git push -f origin "refs/tags/v${VERSION}"
+          gh release create "v${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "opencode v${VERSION}" \
+            --notes "Engine build of anomalyco/opencode \`${{ inputs.upstream_ref }}\` + OpenWork patches (see openwork/patches on the default branch)." \
+            || echo "release already exists; assets will be clobbered"
+
+      # 4. Build all platform binaries (same script upstream publish.yml uses)
+      #    and upload them; OPENCODE_RELEASE gates the upload inside build.ts.
+      - uses: ./.github/actions/setup-bun
+
+      - name: Build and upload engine binaries
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_RELEASE: "true"
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./packages/opencode/script/build.ts
+
+      - name: Summarize
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "v${{ inputs.version }}" --repo "${{ github.repository }}" --json assets \
+            -q '.assets[] | "\(.name) \(.size)"' | tee "$GITHUB_STEP_SUMMARY"
