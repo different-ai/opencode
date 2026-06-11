@@ -1,0 +1,78 @@
+name: upstream-sync
+
+# Follows anomalyco/opencode's release cadence automatically:
+#  1. fast-forwards this fork's `dev` mirror branch,
+#  2. merges upstream `dev` into `openwork-dev` (workflows + patches),
+#  3. when upstream publishes a release we have not built yet, cuts
+#     v<upstream>-openwork.0 via engine-release.yml.
+#
+# Consumers (the OpenWork repo) stay pinned to an exact fork release in
+# constants.json; this workflow only makes new candidates available.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      need_release: ${{ steps.decide.outputs.need_release }}
+      upstream_tag: ${{ steps.decide.outputs.upstream_tag }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - name: Fast-forward dev mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=dev \
+            -q '.message'
+
+      - uses: actions/checkout@v4
+        with:
+          ref: openwork-dev
+          fetch-depth: 0
+
+      - name: Merge upstream dev into openwork-dev
+        run: |
+          git config user.name "openwork-engine-bot"
+          git config user.email "engineering@different.ai"
+          git fetch origin dev
+          if ! git merge --no-edit origin/dev; then
+            echo "::error::Merge conflict syncing openwork-dev with upstream dev — resolve manually"
+            exit 1
+          fi
+          git push origin openwork-dev
+
+      - name: Decide whether a new engine release is needed
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(gh release view --repo anomalyco/opencode --json tagName -q .tagName)
+          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
+          echo "Latest upstream release: ${UPSTREAM_TAG}"
+          EXISTING=$(gh api "repos/${{ github.repository }}/releases" --paginate \
+            -q '.[].tag_name' | grep -c "^v${UPSTREAM_VERSION}-openwork\." || true)
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "Fork already has a build for ${UPSTREAM_VERSION}; nothing to do"
+            echo "need_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_release=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${UPSTREAM_VERSION}-openwork.0" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.need_release == 'true'
+    uses: ./.github/workflows/engine-release.yml
+    permissions:
+      contents: write
+    with:
+      upstream_ref: ${{ needs.sync.outputs.upstream_tag }}
+      version: ${{ needs.sync.outputs.version }}
