@@ -62,21 +62,22 @@ jobs:
             git am "$RUNNER_TEMP"/openwork-patches/*.patch
           fi
 
-      # 3. Tag the exact build commit and create the release up front so
-      #    build.ts can `gh release upload` into it.
+      # 3. Create the release up front so build.ts can `gh release upload`
+      #    into it. The release tag targets the openwork-dev workflow commit
+      #    (GITHUB_TOKEN may not push tags at upstream commits because their
+      #    tree carries different workflow files); the actual build source is
+      #    recorded in the notes: upstream ref + patches.
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ inputs.version }}"
-          git config user.name "openwork-engine-bot"
-          git config user.email "engineering@different.ai"
-          git tag -f "v${VERSION}"
-          git push -f origin "refs/tags/v${VERSION}"
+          UPSTREAM_SHA=$(git rev-parse "${{ inputs.upstream_ref }}^{commit}")
           gh release create "v${VERSION}" \
             --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
             --title "opencode v${VERSION}" \
-            --notes "Engine build of anomalyco/opencode \`${{ inputs.upstream_ref }}\` + OpenWork patches (see openwork/patches on the default branch)." \
+            --notes "Engine build of anomalyco/opencode \`${{ inputs.upstream_ref }}\` (\`${UPSTREAM_SHA}\`) + OpenWork patches from \`openwork/patches\` at \`${{ github.sha }}\`." \
             || echo "release already exists; assets will be clobbered"
 
       # 4. Build all platform binaries (same script upstream publish.yml uses)
