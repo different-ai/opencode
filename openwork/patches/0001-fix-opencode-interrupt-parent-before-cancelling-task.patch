@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Benjamin Shafii <ben@prologe.io>
+Date: Thu, 10 Sep 2026 08:10:32 -0700
+Subject: [PATCH] fix(opencode): interrupt parent before cancelling task jobs
+
+---
+ packages/opencode/src/session/run-state.ts |  8 +--
+ packages/opencode/test/tool/task.test.ts   | 61 ++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/packages/opencode/src/session/run-state.ts b/packages/opencode/src/session/run-state.ts
+index 5cefdd0..1a51371 100644
+--- a/packages/opencode/src/session/run-state.ts
++++ b/packages/opencode/src/session/run-state.ts
+@@ -75,14 +75,16 @@ const layer = Layer.effect(
+     })
+ 
+     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+-      yield* cancelBackgroundJobs(background, sessionID)
+       const data = yield* InstanceState.get(state)
+       const existing = data.runners.get(sessionID)
++      // Settling a foreground task job wakes its waiting parent. Interrupt the
++      // parent first so that wakeup cannot start another provider turn.
++      if (existing) yield* existing.cancel
++      // Jobs can exist before a runner is registered, or outlive its scope.
++      yield* cancelBackgroundJobs(background, sessionID)
+       if (!existing) {
+         yield* status.set(sessionID, { type: "idle" })
+-        return
+       }
+-      yield* existing.cancel
+     })
+ 
+     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
+diff --git a/packages/opencode/test/tool/task.test.ts b/packages/opencode/test/tool/task.test.ts
+index 2bcf05a..99648b6 100644
+--- a/packages/opencode/test/tool/task.test.ts
++++ b/packages/opencode/test/tool/task.test.ts
+@@ -982,4 +982,65 @@ describe("tool.task", () => {
+       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
+     }),
+   )
++
++  it.instance("interrupts the parent before settling child jobs, without continuing the parent", () =>
++    Effect.gen(function* () {
++      const jobs = yield* BackgroundJob.Service
++      const runState = yield* SessionRunState.Service
++      const sessions = yield* Session.Service
++      const { chat, assistant } = yield* seed()
++      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
++      const grandchild = yield* sessions.create({ parentID: child.id, title: "grandchild" })
++      const other = yield* sessions.create({ title: "unrelated" })
++      const ready = yield* Deferred.make<void>()
++      const events: string[] = []
++      for (const item of [
++        { session: child, parentID: chat.id },
++        { session: grandchild, parentID: child.id },
++        { session: other, parentID: other.id },
++      ]) {
++        yield* jobs.start({
++          id: item.session.id,
++          type: "task",
++          metadata: { parentSessionId: item.parentID, sessionId: item.session.id },
++          run: Effect.never.pipe(
++            Effect.onInterrupt(() =>
++              Effect.sync(() => {
++                events.push(item.session.id)
++              }),
++            ),
++          ),
++        })
++      }
++      const result = { info: assistant, parts: [] }
++      const parent = yield* runState
++        .ensureRunning(
++          chat.id,
++          Effect.succeed(result),
++          Effect.gen(function* () {
++            yield* Deferred.succeed(ready, undefined)
++            yield* jobs.wait({ id: child.id })
++            events.push("continued")
++            return result
++          }).pipe(
++            Effect.onInterrupt(() =>
++              Effect.sync(() => {
++                events.push("parent interrupted")
++              }),
++            ),
++          ),
++        )
++        .pipe(Effect.forkChild)
++      yield* Deferred.await(ready)
++      yield* runState.cancel(chat.id)
++      yield* Fiber.join(parent)
++      expect(events[0]).toBe("parent interrupted")
++      expect(events).not.toContain("continued")
++      expect(events).toContain(child.id)
++      expect(events).toContain(grandchild.id)
++      expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
++      expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
++      expect((yield* jobs.get(other.id))?.status).toBe("running")
++    }),
++  )
+ })
+-- 
+2.43.0
+
